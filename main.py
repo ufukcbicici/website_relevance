@@ -6,6 +6,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from spacy.lang.en import English
 from spacy.lang.pt import Portuguese
 from spacy.lang.es import Spanish
+import gensim
+from collections import Counter
 
 # Constants - Hyperparameters
 interactions_scores_dict = {'VIEW': 1, 'BOOKMARK': 2, 'FOLLOW': 3, 'LIKE': 4, 'COMMENT CREATED': 5}
@@ -19,7 +21,7 @@ interactions_matrix = None
 hidden_dimensions = 20
 language_objects = {"en": English(), "pt": Portuguese(), "es": Spanish()}
 tokenizers = {}
-
+selected_tokens = []
 
 # def create_interaction_matrix():
 #     interactions_df = pd.read_csv('interactions.csv')
@@ -45,8 +47,8 @@ def create_article_tokens():
         return text
 
     tf_idf_vectorizer = TfidfVectorizer(tokenizer=identity_tokenizer, stop_words="english",
-                                        norm='l2', use_idf=True, smooth_idf=True, sublinear_tf=False,
-                                        ngram_range=(1, 2), lowercase=False)
+                                        norm='l2', use_idf=True, smooth_idf=True, sublinear_tf=True,
+                                        ngram_range=(1, 1), lowercase=False)
     corpus = []
     for index, row in articles_df.iterrows():
         language = row["lang"]
@@ -59,23 +61,23 @@ def create_article_tokens():
         if language not in tokenizers:
             tokenizers[language] = nlp_object.Defaults.create_tokenizer(nlp_object)
         tokenizer = tokenizers[language]
-        # Tokenize both the article title and text
-        title_text = row["title"]
-        article_text = row["text"]
-        title_text = title_text.lower().replace("\n", " ")
-        article_text = article_text.lower().replace("\n", " ")
-        title_tokens = tokenizer(title_text)
-        article_tokens = tokenizer(article_text)
-        title_tokens = [tk.text for tk in title_tokens if tk.text != "" and len(tk.text) > 1]
-        article_tokens = [tk.text for tk in article_tokens if tk.text != "" and len(tk.text) > 1]
-        all_tokens = []
-        all_tokens.extend(title_tokens)
-        all_tokens.extend(article_tokens)
-        corpus.append(all_tokens)
+        # Calculate the text summary with Gensim's TextRank implementation.
+        whole_text = row["title"] + "\n" + row["text"]
+        summary = gensim.summarization.summarize(text=whole_text, ratio=0.1, split=False)
+        summary = summary.lower().replace("\n", " ")
+        summary_tokens = tokenizer(summary)
+        summary_tokens = [tk.text for tk in summary_tokens if tk.text != "" and len(tk.text) > 1]
+        corpus.append(summary_tokens)
         print("Article {0} has been processed.".format(index))
     # Transform words; apply tf-idf transformer
-    tf_idf_vectorizer.fit(corpus)
-    print("X")
+    feature_matrix = tf_idf_vectorizer.fit_transform(corpus)
+    # Calculate mean tf-idf scores for all n-grams over all articles.
+    tf_idf_scores = np.mean(feature_matrix, axis=0)
+    feature_names = tf_idf_vectorizer.get_feature_names()
+    feature_scores = [(feature_names[idx], tf_idf_scores[0, idx]) for idx in range(tf_idf_scores.shape[1])]
+    sorted_features = sorted(feature_scores, key=lambda tpl: tpl[1], reverse=True)
+    final_tokens = [tpl[0] for tpl in sorted_features[0:5000]]
+    return final_tokens
 
 
 if __name__ == "__main__":
