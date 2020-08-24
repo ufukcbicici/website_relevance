@@ -7,6 +7,7 @@ from spacy.lang.en import English
 from spacy.lang.pt import Portuguese
 from spacy.lang.es import Spanish
 import gensim
+import re
 from collections import Counter
 
 # Constants - Hyperparameters
@@ -16,30 +17,18 @@ interactions_scores_dict = {'VIEW': 1, 'BOOKMARK': 2, 'FOLLOW': 3, 'LIKE': 4, 'C
 interactions_df = pd.read_csv('interactions.csv')
 articles_df = pd.read_csv('articles.csv')
 person_le = preprocessing.LabelEncoder()
-article_le = preprocessing.LabelEncoder()
-interactions_matrix = None
+tokens_le = preprocessing.LabelEncoder()
 hidden_dimensions = 20
 language_objects = {"en": English(), "pt": Portuguese(), "es": Spanish()}
 tokenizers = {}
 selected_tokens = []
+summaries = {}
+filter_regex = "[^A-Za-z0-9]+"
 
-# def create_interaction_matrix():
-#     interactions_df = pd.read_csv('interactions.csv')
-#     articles_df = pd.read_csv('articles.csv')
-#     # User ids
-#     person_le.fit(interactions_df.personId.unique())
-#     # Articles ids
-#     article_le.fit(articles_df.contentId.unique())
-#     # Create interactions matrix
-#     user_count = len(person_le.classes_)
-#     article_count = len(article_le.classes_)
-#     interactions_matrix = np.zeros(shape=(user_count, article_count), dtype=np.float32)
-#     # Fill the interaction matrix: For every interaction entry in
-#
-#     print("X")
-
-# We create tokens for articles based on tf-idf analysis of the 1-gram (single words)
-# We are going to use Spacy's tokenizer for the corresponding language
+# We summarize each article with Spacy's TextRank implementation. This eliminates most of the noisy information
+# in the texts. Then we apply tf-idf analysis to the article summaries. For every unique token in the obtained corpus
+# of summaries, we calculate the expected tf-idf score over all articles. Then we sort the tokens in descending order
+# of their expected tf-idf scores. The first 5000 tokens will constitute the representing tokens of our article corpus.
 
 
 def create_article_tokens():
@@ -52,6 +41,9 @@ def create_article_tokens():
     corpus = []
     for index, row in articles_df.iterrows():
         language = row["lang"]
+        article_id = row["contentId"]
+        # if article_id == 5714314286511882372:
+        #     print("X")
         # If we don't support the language, fall back to English.
         if language not in language_objects:
             nlp_object = language_objects["en"]
@@ -64,10 +56,20 @@ def create_article_tokens():
         # Calculate the text summary with Gensim's TextRank implementation.
         whole_text = row["title"] + "\n" + row["text"]
         summary = gensim.summarization.summarize(text=whole_text, ratio=0.1, split=False)
-        summary = summary.lower().replace("\n", " ")
+        summary = summary.lower().replace("\n", " ").replace("'", "")
         summary_tokens = tokenizer(summary)
-        summary_tokens = [tk.text for tk in summary_tokens if tk.text != "" and len(tk.text) > 1]
-        corpus.append(summary_tokens)
+        filtered_summary_tokens = []
+        # Process tokens with regex; remove all special characters
+        for tk in summary_tokens:
+            original_token_text = tk.text
+            filtered_text = re.sub(filter_regex, '', original_token_text)
+            # print("filtered_text={0}".format(filtered_text))
+            # print(len(filtered_text))
+            if len(filtered_text) > 1:
+                filtered_summary_tokens.append(filtered_text)
+            # summary_tokens = [tk.text for tk in summary_tokens if tk.text != "" and len(tk.text) > 1]
+        summaries[article_id] = filtered_summary_tokens
+        corpus.append(filtered_summary_tokens)
         print("Article {0} has been processed.".format(index))
     # Transform words; apply tf-idf transformer
     feature_matrix = tf_idf_vectorizer.fit_transform(corpus)
@@ -80,6 +82,33 @@ def create_article_tokens():
     return final_tokens
 
 
+def create_interaction_matrix():
+    token_set = set(selected_tokens)
+    # User ids
+    person_le.fit(interactions_df.personId.unique())
+    # Token ids
+    tokens_le.fit(selected_tokens)
+    # Create interactions matrix
+    user_count = len(person_le.classes_)
+    article_count = len(tokens_le.classes_)
+    interactions_matrix = np.zeros(shape=(user_count, article_count), dtype=np.float32)
+    # Fill the interaction matrix: For every interaction entry in
+    for index, row in interactions_df.iterrows():
+        person_id = row["personId"]
+        person_index = person_le.transform([person_id])[0]
+        article_id = row["contentId"]
+        event_type = row["eventType"]
+        summary = summaries[article_id]
+        valid_tokens = [tk for tk in summary if tk in token_set]
+        token_indices = tokens_le.transform(valid_tokens)
+        score = interactions_scores_dict[event_type]
+        for token_index in token_indices:
+            interactions_matrix[person_index, token_index] += score
+    return interactions_matrix
+
+
 if __name__ == "__main__":
     # create_interaction_matrix()
-    create_article_tokens()
+    selected_tokens = create_article_tokens()
+    interactions_matrix = create_interaction_matrix()
+
