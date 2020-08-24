@@ -8,6 +8,8 @@ from spacy.lang.pt import Portuguese
 from spacy.lang.es import Spanish
 import gensim
 import re
+import os
+import pickle
 from collections import Counter
 
 # Constants - Hyperparameters
@@ -21,9 +23,11 @@ tokens_le = preprocessing.LabelEncoder()
 hidden_dimensions = 20
 language_objects = {"en": English(), "pt": Portuguese(), "es": Spanish()}
 tokenizers = {}
-selected_tokens = []
 summaries = {}
 filter_regex = "[^A-Za-z0-9]+"
+batch_size = 128
+max_iterations = 100000
+
 
 # We summarize each article with Spacy's TextRank implementation. This eliminates most of the noisy information
 # in the texts. Then we apply tf-idf analysis to the article summaries. For every unique token in the obtained corpus
@@ -34,6 +38,12 @@ filter_regex = "[^A-Za-z0-9]+"
 def create_article_tokens():
     def identity_tokenizer(text):
         return text
+
+    if os.path.isfile("selected_tokens.sav"):
+        f = open(os.path.join("selected_tokens.sav"), "rb")
+        final_tokens = pickle.load(f)
+        f.close()
+        return final_tokens
 
     tf_idf_vectorizer = TfidfVectorizer(tokenizer=identity_tokenizer, stop_words="english",
                                         norm='l2', use_idf=True, smooth_idf=True, sublinear_tf=True,
@@ -79,10 +89,20 @@ def create_article_tokens():
     feature_scores = [(feature_names[idx], tf_idf_scores[0, idx]) for idx in range(tf_idf_scores.shape[1])]
     sorted_features = sorted(feature_scores, key=lambda tpl: tpl[1], reverse=True)
     final_tokens = [tpl[0] for tpl in sorted_features[0:5000]]
+    # Save the tokens
+    f = open(os.path.join("selected_tokens.sav"), "wb")
+    pickle.dump(final_tokens, f)
+    f.close()
     return final_tokens
 
 
 def create_interaction_matrix():
+    if os.path.isfile("interactions_matrix.sav"):
+        f = open(os.path.join("interactions_matrix.sav"), "rb")
+        interactions_matrix = pickle.load(f)
+        f.close()
+        return interactions_matrix
+
     token_set = set(selected_tokens)
     # User ids
     person_le.fit(interactions_df.personId.unique())
@@ -94,21 +114,61 @@ def create_interaction_matrix():
     interactions_matrix = np.zeros(shape=(user_count, article_count), dtype=np.float32)
     # Fill the interaction matrix: For every interaction entry in
     for index, row in interactions_df.iterrows():
+        if (index + 1) % 1000 == 0:
+            print("{0} rows have been processed.".format(index))
         person_id = row["personId"]
         person_index = person_le.transform([person_id])[0]
         article_id = row["contentId"]
         event_type = row["eventType"]
+        if article_id not in summaries:
+            continue
         summary = summaries[article_id]
         valid_tokens = [tk for tk in summary if tk in token_set]
         token_indices = tokens_le.transform(valid_tokens)
         score = interactions_scores_dict[event_type]
         for token_index in token_indices:
             interactions_matrix[person_index, token_index] += score
+    f = open(os.path.join("interactions_matrix.sav"), "wb")
+    pickle.dump(interactions_matrix, f)
+    f.close()
     return interactions_matrix
+
+
+def apply_matrix_factorization(V_):
+    # Interaction matrix
+    v_ = tf.placeholder(dtype=tf.float32, shape=V_.shape)
+    # User matrix
+    W_ = tf.get_variable(trainable=True,
+                         initializer=tf.truncated_normal(shape=(V_.shape[0], hidden_dimensions), stddev=0.1))
+    # Token matrix
+    H_ = tf.get_variable(trainable=True,
+                         initializer=tf.truncated_normal(shape=(hidden_dimensions, V_.shape[1]), stddev=0.1))
+    # User bias
+    b_w = tf.get_variable(trainable=True,
+                          initializer=tf.truncated_normal(shape=(V_.shape[0],), stddev=0.1))
+    # Token bias
+    b_h = tf.get_variable(trainable=True,
+                          initializer=tf.truncated_normal(shape=(V_.shape[1],), stddev=0.1))
+    # Mean bias
+    mu = tf.get_variable(trainable=True, initializer=tf.truncated_normal(shape=(1,), stddev=0.1))
+    # Selected user and token indices
+    user_indices = tf.placeholder(dtype=tf.int32, shape=[None])
+    token_indices = tf.placeholder(dtype=tf.int32, shape=[None])
+    indices = tf.concat([user_indices, token_indices], axis=1)
+    # Get non zero ratings from the interaction matrix
+    ratings = tf.gather_nd(params=v_, indices=indices)
+    # Get feature vectors for users
+
+    sess = tf.Session()
+    sess.run(tf.global_variables_initializer())
+    # Indices for the non-zero entries of the interactions matrix
+    non_zero_ratings = np.nonzero(V_)
+    # for iteration in range(max_iterations):
+    print("X")
 
 
 if __name__ == "__main__":
     # create_interaction_matrix()
     selected_tokens = create_article_tokens()
     interactions_matrix = create_interaction_matrix()
-
+    apply_matrix_factorization(interactions_matrix)
