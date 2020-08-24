@@ -20,13 +20,14 @@ interactions_df = pd.read_csv('interactions.csv')
 articles_df = pd.read_csv('articles.csv')
 person_le = preprocessing.LabelEncoder()
 tokens_le = preprocessing.LabelEncoder()
-hidden_dimensions = 20
+hidden_dimensions = 250
 language_objects = {"en": English(), "pt": Portuguese(), "es": Spanish()}
 tokenizers = {}
 summaries = {}
 filter_regex = "[^A-Za-z0-9]+"
-batch_size = 128
+batch_size = 10000
 max_iterations = 100000
+l2_lambda = 0.0
 
 
 # We summarize each article with Spacy's TextRank implementation. This eliminates most of the noisy information
@@ -99,9 +100,9 @@ def create_article_tokens():
 def create_interaction_matrix():
     if os.path.isfile("interactions_matrix.sav"):
         f = open(os.path.join("interactions_matrix.sav"), "rb")
-        interactions_matrix = pickle.load(f)
+        matrix = pickle.load(f)
         f.close()
-        return interactions_matrix
+        return matrix
 
     token_set = set(selected_tokens)
     # User ids
@@ -136,35 +137,82 @@ def create_interaction_matrix():
 
 def apply_matrix_factorization(V_):
     # Interaction matrix
-    v_ = tf.placeholder(dtype=tf.float32, shape=V_.shape)
-    # User matrix
-    W_ = tf.get_variable(trainable=True,
-                         initializer=tf.truncated_normal(shape=(V_.shape[0], hidden_dimensions), stddev=0.1))
-    # Token matrix
-    H_ = tf.get_variable(trainable=True,
-                         initializer=tf.truncated_normal(shape=(hidden_dimensions, V_.shape[1]), stddev=0.1))
-    # User bias
-    b_w = tf.get_variable(trainable=True,
-                          initializer=tf.truncated_normal(shape=(V_.shape[0],), stddev=0.1))
-    # Token bias
-    b_h = tf.get_variable(trainable=True,
-                          initializer=tf.truncated_normal(shape=(V_.shape[1],), stddev=0.1))
-    # Mean bias
-    mu = tf.get_variable(trainable=True, initializer=tf.truncated_normal(shape=(1,), stddev=0.1))
-    # Selected user and token indices
-    user_indices = tf.placeholder(dtype=tf.int32, shape=[None])
-    token_indices = tf.placeholder(dtype=tf.int32, shape=[None])
-    indices = tf.concat([user_indices, token_indices], axis=1)
-    # Get non zero ratings from the interaction matrix
-    ratings = tf.gather_nd(params=v_, indices=indices)
-    # Get feature vectors for users
+    with tf.variable_scope("MF_Regressor"):
+        global_step = tf.Variable(0, name='global_step', trainable=False)
+        v_ = tf.constant(V_)
+        # User matrix
+        W_ = tf.get_variable(trainable=True,
+                             initializer=tf.random_uniform_initializer(minval=0.0, maxval=0.1),
+                             shape=(V_.shape[0], hidden_dimensions),
+                             name="user_matrix")
+        # Token matrix
+        H_ = tf.get_variable(trainable=True,
+                             initializer=tf.random_uniform_initializer(minval=0.0, maxval=0.1),
+                             shape=(hidden_dimensions, V_.shape[1]),
+                             name="token_matrix")
+        # User bias
+        b_w = tf.get_variable(trainable=True,
+                              initializer=tf.random_uniform_initializer(minval=0.0, maxval=0.1),
+                              shape=(V_.shape[0],),
+                              name="user_bias")
+        # Token bias
+        b_h = tf.get_variable(trainable=True,
+                              initializer=tf.random_uniform_initializer(minval=0.0, maxval=0.1),
+                              shape=(V_.shape[1],),
+                              name="token_bias")
+        # Mean bias
+        mu = tf.get_variable(trainable=True,
+                             initializer=tf.random_uniform_initializer(minval=0.0, maxval=0.1),
+                             shape=(1,),
+                             name="mean_bias")
+        # Selected user and token indices
+        user_indices = tf.placeholder(dtype=tf.int32, shape=[None])
+        token_indices = tf.placeholder(dtype=tf.int32, shape=[None])
+        regularizer_strength = tf.placeholder(dtype=tf.float32)
+        indices = tf.stack([user_indices, token_indices], axis=1)
+        # Get non zero ratings from the interaction matrix
+        ratings = tf.gather_nd(params=v_, indices=indices)
+        # Get feature vectors for users
+        user_features = tf.gather_nd(params=W_, indices=tf.expand_dims(user_indices, axis=1))
+        token_features = tf.gather_nd(params=tf.transpose(H_), indices=tf.expand_dims(token_indices, axis=1))
+        user_biases = tf.gather_nd(params=b_w, indices=tf.expand_dims(user_indices, axis=1))
+        token_biases = tf.gather_nd(params=b_h, indices=tf.expand_dims(token_indices, axis=1))
+        # Estimated ratings
+        unbiased_rating_estimates = tf.reduce_sum(tf.multiply(user_features, token_features), axis=1)
+        # Final estimations
+        estimated_ratings = unbiased_rating_estimates + user_biases + token_biases + mu
+        norms = tf.norm(user_features, ord="euclidean") + tf.norm(token_features, ord="euclidean") + \
+                tf.norm(user_biases, ord="euclidean") + tf.norm(token_biases, ord="euclidean")
+        loss = tf.reduce_mean(tf.square(ratings - estimated_ratings)) + regularizer_strength * norms
+        # Estimated matrix
+        estimated_matrix = tf.linalg.matmul(W_, H_)
+        optimizer = tf.train.AdamOptimizer().minimize(loss, global_step=global_step)
 
     sess = tf.Session()
     sess.run(tf.global_variables_initializer())
     # Indices for the non-zero entries of the interactions matrix
-    non_zero_ratings = np.nonzero(V_)
-    # for iteration in range(max_iterations):
-    print("X")
+    non_zero_rating_indices = np.stack(np.nonzero(V_), axis=1)
+    losses = []
+    for iteration in range(max_iterations):
+        # Draw random minibatches from existing ratings
+        minibatch_indices = np.random.choice(non_zero_rating_indices.shape[0], batch_size, replace=True)
+        selected_rating_indices = non_zero_rating_indices[minibatch_indices]
+        results = sess.run([loss, optimizer],
+                           feed_dict={user_indices: selected_rating_indices[:, 0],
+                                      token_indices: selected_rating_indices[:, 1],
+                                      regularizer_strength: l2_lambda})
+        losses.append(results[0])
+        if iteration % 10 == 0:
+            mean_loss = np.mean(np.array(losses))
+            print("Iteration:{0} mean_loss={1}".format(iteration, mean_loss))
+            losses = []
+    # Reconstruct the dense matrix
+    res = sess.run([estimated_matrix])
+    estimated_interactions_matrix = res[0]
+    assert estimated_interactions_matrix.shape == V_.shape
+    f = open(os.path.join("estimated_interactions_matrix.sav"), "wb")
+    pickle.dump(estimated_interactions_matrix, f)
+    f.close()
 
 
 if __name__ == "__main__":
