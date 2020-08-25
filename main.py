@@ -10,7 +10,6 @@ import gensim
 import re
 import os
 import pickle
-from collections import Counter
 
 # Constants - Hyperparameters
 interactions_scores_dict = {'VIEW': 1, 'BOOKMARK': 2, 'FOLLOW': 3, 'LIKE': 4, 'COMMENT CREATED': 5}
@@ -27,7 +26,7 @@ summaries = {}
 filter_regex = "[^A-Za-z0-9]+"
 batch_size = 10000
 max_iterations = 100000
-l2_lambda = 0.0
+l2_lambda = 0.001
 
 
 # We summarize each article with Spacy's TextRank implementation. This eliminates most of the noisy information
@@ -124,7 +123,7 @@ def create_interaction_matrix():
         if article_id not in summaries:
             continue
         summary = summaries[article_id]
-        valid_tokens = [tk for tk in summary if tk in token_set]
+        valid_tokens = list(set([tk for tk in summary if tk in token_set]))
         token_indices = tokens_le.transform(valid_tokens)
         score = interactions_scores_dict[event_type]
         for token_index in token_indices:
@@ -136,6 +135,12 @@ def create_interaction_matrix():
 
 
 def apply_matrix_factorization(V_):
+    if os.path.isfile("estimated_interactions_matrix.sav"):
+        f = open(os.path.join("estimated_interactions_matrix.sav"), "rb")
+        matrix = pickle.load(f)
+        f.close()
+        return matrix
+
     # Interaction matrix
     with tf.variable_scope("MF_Regressor"):
         global_step = tf.Variable(0, name='global_step', trainable=False)
@@ -183,9 +188,10 @@ def apply_matrix_factorization(V_):
         estimated_ratings = unbiased_rating_estimates + user_biases + token_biases + mu
         norms = tf.norm(user_features, ord="euclidean") + tf.norm(token_features, ord="euclidean") + \
                 tf.norm(user_biases, ord="euclidean") + tf.norm(token_biases, ord="euclidean")
-        loss = tf.reduce_mean(tf.square(ratings - estimated_ratings)) + regularizer_strength * norms
-        # Estimated matrix
-        estimated_matrix = tf.linalg.matmul(W_, H_)
+        # regression_loss = tf.reduce_mean(tf.losses.huber_loss(labels=ratings, predictions=estimated_ratings))
+        regression_loss = tf.reduce_mean(tf.square(ratings - estimated_ratings))
+        # loss = tf.reduce_mean(tf.square(ratings - estimated_ratings)) + regularizer_strength * norms
+        loss = regression_loss + regularizer_strength * norms
         optimizer = tf.train.AdamOptimizer().minimize(loss, global_step=global_step)
 
     sess = tf.Session()
@@ -207,16 +213,40 @@ def apply_matrix_factorization(V_):
             print("Iteration:{0} mean_loss={1}".format(iteration, mean_loss))
             losses = []
     # Reconstruct the dense matrix
-    res = sess.run([estimated_matrix])
-    estimated_interactions_matrix = res[0]
-    assert estimated_interactions_matrix.shape == V_.shape
+    # Estimated matrix
+    WH_mat, bw_vec, bh_vec, mu_sca = sess.run([tf.linalg.matmul(W_, H_), b_w, b_h, mu])
+    assert WH_mat.shape == V_.shape
+    bw_mat = np.repeat(np.expand_dims(bw_vec, axis=1), axis=1, repeats=V_.shape[1])
+    bh_mat = np.repeat(np.expand_dims(bh_vec, axis=0), axis=0, repeats=V_.shape[0])
+    estimated_interactions_matrix = WH_mat + bw_mat + bh_mat + mu_sca
     f = open(os.path.join("estimated_interactions_matrix.sav"), "wb")
     pickle.dump(estimated_interactions_matrix, f)
     f.close()
+    return estimated_interactions_matrix
+
+
+def convert_interactions_matrix_to_relevance(i_matrix):
+    # Normalize
+    # zero_mean_i_matrix = i_matrix - np.mean(i_matrix)
+    # normalized_i_matrix = zero_mean_i_matrix / np.std(zero_mean_i_matrix)
+    # Squash into [0, 1] interval
+    max_entry = np.max(i_matrix)
+    min_entry = np.min(i_matrix)
+    r_matrix = (i_matrix - min_entry) / (max_entry - min_entry)
+    return r_matrix
 
 
 if __name__ == "__main__":
     # create_interaction_matrix()
     selected_tokens = create_article_tokens()
     interactions_matrix = create_interaction_matrix()
-    apply_matrix_factorization(interactions_matrix)
+    interactions_matrix_hat = apply_matrix_factorization(interactions_matrix)
+    relevance_matrix = convert_interactions_matrix_to_relevance(interactions_matrix_hat)
+    # Display a relevance vector
+    relevance_vector = relevance_matrix[682, :]
+    tokens_le = preprocessing.LabelEncoder()
+    tokens_le.fit(selected_tokens)
+    token_names = tokens_le.inverse_transform([idx for idx in range(len(selected_tokens))])
+    df = pd.DataFrame({"token": token_names, "relevance": relevance_vector})\
+        .sort_values(by="relevance", ascending=False)
+    print("X")
